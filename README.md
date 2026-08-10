@@ -400,6 +400,11 @@ put Postgres in the critical path of an API whose job is proxying somebody else'
 database would mean a slow gateway. A write failure loses metrics, which is the right thing to
 lose. The buffer is bounded and flushed on shutdown.
 
+**History is pruned automatically.** `REQUEST_RETENTION_DAYS` defaults to 90 — a table nothing
+ever deletes from grows until queries crawl. Pruning is batched, guarded by an advisory lock so
+only one replica does it, and bounded per run so it never becomes a long-running transaction.
+Set it to `0` to keep everything forever.
+
 Set per-model pricing in `openllm.yaml` (USD per million tokens). A model with no entry records
 **NULL cost, never zero** — "we don't know" and "it was free" are different statements, and
 zero-filling makes every total understate the bill in a way that looks like good news.

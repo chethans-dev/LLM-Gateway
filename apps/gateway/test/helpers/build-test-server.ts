@@ -63,6 +63,7 @@ const baseConfig: AppConfig = {
   database: { skipMigrations: true },
   observability: {
     recording: { enabled: false, batchSize: 10, flushIntervalMs: 50, maxBufferSize: 100 },
+    retention: { retentionDays: 90, intervalMs: 3_600_000, batchSize: 100 },
     pricing: { mock: { inputPerMillionTokens: 0, outputPerMillionTokens: 0 } },
   },
 };

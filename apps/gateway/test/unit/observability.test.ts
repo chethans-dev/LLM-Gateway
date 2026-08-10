@@ -33,6 +33,7 @@ async function build(recorder: RequestRecorder): Promise<FastifyInstance> {
   const config = createTestConfig({
     observability: {
       recording: { enabled: true, batchSize: 10, flushIntervalMs: 50, maxBufferSize: 100 },
+      retention: { retentionDays: 90, intervalMs: 3_600_000, batchSize: 100 },
       pricing: { mock: { inputPerMillionTokens: 1_000, outputPerMillionTokens: 2_000 } },
     },
   });
@@ -156,6 +157,7 @@ describe("what gets recorded", () => {
     const config = createTestConfig({
       observability: {
         recording: { enabled: true, batchSize: 10, flushIntervalMs: 50, maxBufferSize: 100 },
+      retention: { retentionDays: 90, intervalMs: 3_600_000, batchSize: 100 },
         pricing: {},
       },
     });

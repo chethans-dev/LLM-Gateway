@@ -107,6 +107,17 @@ export interface AppConfig {
       readonly flushIntervalMs: number;
       readonly maxBufferSize: number;
     };
+    /**
+     * Retention for the `requests` table.
+     *
+     * `retentionDays: 0` disables pruning and keeps history forever — which is
+     * the caller's decision to make, not a default to fall into.
+     */
+    readonly retention: {
+      readonly retentionDays: number;
+      readonly intervalMs: number;
+      readonly batchSize: number;
+    };
     /** Merged over the built-in defaults. Cost figures are estimates. */
     readonly pricing: PricingTable;
   };
@@ -328,6 +339,11 @@ export function loadConfig(
         batchSize: env.REQUEST_RECORDING_BATCH_SIZE,
         flushIntervalMs: env.REQUEST_RECORDING_FLUSH_MS,
         maxBufferSize: env.REQUEST_RECORDING_MAX_BUFFER,
+      },
+      retention: {
+        retentionDays: env.REQUEST_RETENTION_DAYS,
+        intervalMs: env.REQUEST_PRUNE_INTERVAL_MS,
+        batchSize: env.REQUEST_PRUNE_BATCH_SIZE,
       },
       pricing: mergePricing(toPricingTable(file.pricing)),
     },

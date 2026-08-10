@@ -136,6 +136,21 @@ const envObjectSchema = z.object({
   /** Ceiling on buffered records; oldest are dropped past it. */
   REQUEST_RECORDING_MAX_BUFFER: z.coerce.number().int().positive().default(10_000),
 
+  /**
+   * Days of request history to keep. `0` keeps everything forever.
+   *
+   * Defaulting to a finite window rather than 0 is deliberate: a table nothing
+   * ever deletes from grows until queries crawl, and "unbounded by default" is
+   * an outage waiting for enough traffic. 90 days is far more than most
+   * dashboards look back, and these rows are metadata — no prompts, nothing
+   * irreplaceable. Set 0 if you ship them elsewhere and want them kept.
+   */
+  REQUEST_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(90),
+  /** How often the pruner runs. */
+  REQUEST_PRUNE_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),
+  /** Rows per DELETE. Small batches keep locks short and let autovacuum keep up. */
+  REQUEST_PRUNE_BATCH_SIZE: z.coerce.number().int().positive().max(50_000).default(5_000),
+
   // ---------------------------------------------------------------------------
   // Authentication (spec §13)
   // ---------------------------------------------------------------------------

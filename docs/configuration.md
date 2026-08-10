@@ -321,6 +321,37 @@ failure loses metrics, which is the correct thing to lose.
 
 The buffer is flushed on shutdown, after the HTTP server closes and before Postgres does.
 
+### Retention
+
+The `requests` table would otherwise grow forever. At 100 requests/second that is roughly 260
+million rows a year, and every dashboard query gets slower until somebody notices — unbounded
+growth in a table nothing deletes from is a latent outage, not a missing feature.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `REQUEST_RETENTION_DAYS` | `90` | Days of history to keep. **`0` keeps everything forever** — a reasonable choice if you ship this data to a warehouse, but not one to fall into by accident. The gateway logs a warning at startup when retention is off. |
+| `REQUEST_PRUNE_INTERVAL_MS` | `3600000` (1h) | How often the pruner runs. |
+| `REQUEST_PRUNE_BATCH_SIZE` | `5000` | Rows per `DELETE`. |
+
+Three things make this safe against a live database:
+
+- **Batched.** One `DELETE ... WHERE created_at < X` over millions of rows holds locks for the
+  whole statement, writes an enormous WAL record and bloats the table. Small chunks let
+  autovacuum keep up and let ordinary traffic interleave. Each statement deletes by primary key
+  from a bounded subquery, so its lock footprint is predictable.
+- **Lock-guarded.** Every replica runs the timer, so a `pg_try_advisory_lock` means exactly one
+  prunes per round and the rest skip immediately. `try` rather than the blocking variant used
+  for migrations — a replica that loses the race should serve traffic, not queue behind someone
+  else's delete loop.
+- **Bounded per run.** A capped number of batches, so a first run against a year of history
+  makes progress and hands control back instead of becoming an hours-long transaction storm.
+
+Pruning is off the request path entirely, and a failure is logged rather than propagated —
+losing a prune round is not worth failing traffic over.
+
+**At very high volume**, monthly partitioning with `DROP PARTITION` is cheaper than deleting
+rows. That is a schema change rather than a setting, and it is not implemented here.
+
 ### Cost estimation (spec §16)
 
 Pricing is **data, not code** — it lives in `openllm.yaml` so a price correction needs no

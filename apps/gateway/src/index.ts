@@ -3,6 +3,7 @@ import { createPostgresClient } from "./infra/postgres.js";
 import { connectRedis, createRedisClient } from "./infra/redis.js";
 import { ShutdownManager } from "./infra/shutdown.js";
 import { createApiKeyRepository } from "./auth/api-key-repository.js";
+import { createRequestPruner } from "./observability/request-pruner.js";
 import { createRequestRecorder } from "./observability/request-recorder.js";
 import { createRequestRepository } from "./observability/request-repository.js";
 import { createChatService } from "./chat/chat-service.js";
@@ -133,6 +134,37 @@ async function main(): Promise<void> {
       })
     : undefined;
 
+  // Without a retention policy the requests table grows forever: at 100 req/s
+  // that is ~260M rows a year, and every dashboard query slows until somebody
+  // notices. 0 disables pruning, which is a choice an operator can make but not
+  // one to fall into by default.
+  const pruner =
+    config.observability.retention.retentionDays > 0
+      ? createRequestPruner({
+          db: postgres.db,
+          logger,
+          retentionDays: config.observability.retention.retentionDays,
+          intervalMs: config.observability.retention.intervalMs,
+          batchSize: config.observability.retention.batchSize,
+        })
+      : undefined;
+
+  if (pruner !== undefined) {
+    pruner.start();
+    logger.info(
+      {
+        retentionDays: config.observability.retention.retentionDays,
+        intervalMs: config.observability.retention.intervalMs,
+      },
+      "request history retention enabled",
+    );
+  } else {
+    logger.warn(
+      { retentionDays: 0 },
+      "request history retention is DISABLED — the requests table will grow without bound",
+    );
+  }
+
   const requestRepository = createRequestRepository(postgres.db);
 
   const registry = createProviderRegistry(config, logger);
@@ -204,6 +236,9 @@ async function main(): Promise<void> {
         if (dropped > 0) logger.warn({ dropped }, "request records dropped during this run");
       },
     });
+  }
+  if (pruner !== undefined) {
+    shutdown.register({ name: "request-pruner", run: async () => pruner.stop() });
   }
   shutdown.register({ name: "redis", run: () => redis.close() });
   shutdown.register({ name: "postgres", run: () => postgres.close() });
