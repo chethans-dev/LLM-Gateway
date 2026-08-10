@@ -21,9 +21,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # No `version:` here on purpose. package.json's `packageManager` field
+      # pins pnpm@10.34.5, and the Dockerfiles read the same value; specifying
+      # it here too makes the action fail with "Multiple versions of pnpm
+      # specified" rather than silently disagreeing later.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -48,9 +50,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # No `version:` here on purpose. package.json's `packageManager` field
+      # pins pnpm@10.34.5, and the Dockerfiles read the same value; specifying
+      # it here too makes the action fail with "Multiple versions of pnpm
+      # specified" rather than silently disagreeing later.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -87,9 +91,11 @@ jobs:
           --health-retries 12
     steps:
       - uses: actions/checkout@v4
+      # No `version:` here on purpose. package.json's `packageManager` field
+      # pins pnpm@10.34.5, and the Dockerfiles read the same value; specifying
+      # it here too makes the action fail with "Multiple versions of pnpm
+      # specified" rather than silently disagreeing later.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
