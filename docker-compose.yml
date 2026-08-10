@@ -1,0 +1,141 @@
+name: openllm-gateway
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: openllm
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # The gateway waits on this before starting, so it must mean "accepting
+      # queries", not merely "process running".
+      test: ["CMD-SHELL", "pg_isready -U postgres -d openllm"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    image: redis:8-alpine
+    # Our Redis usage is rate-limit counters, cached responses, and provider
+    # health state — all reconstructible. Persistence would cost write
+    # throughput to protect data we do not need to survive a restart.
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+      # Set GATEWAY_BUILD_TARGET=dev for tsx watch-reloading.
+      target: ${GATEWAY_BUILD_TARGET:-runtime}
+    # Provider API keys and log level come from .env; absent is fine in Phase 1.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Deliberately NOT interpolated from .env. Inside compose the gateway
+      # always talks to the compose services — otherwise a .env written for
+      # local development ("localhost") silently breaks the containerised run.
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4000
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/openllm
+      REDIS_URL: redis://redis:6379
+      # Enabled so `docker compose up` gives a gateway you can actually send a
+      # request to before configuring any provider keys.
+      #
+      # This file is for local evaluation, not production — it also hardcodes
+      # postgres/postgres. If you adapt it for a real deployment, DROP THIS LINE:
+      # outside development the mock provider is off by default precisely so a
+      # misconfiguration cannot return fabricated completions to real users.
+      # Authentication is OFF here so the quickstart works before any key
+      # exists. NODE_ENV=production above would otherwise turn it ON, which is
+      # the correct production default — DROP THIS LINE for a real deployment
+      # and mint a key with: docker compose exec gateway node apps/gateway/dist/cli/create-key.js "my-app"
+      AUTH_REQUIRED: "false"
+      # Set this to enable the key-management API at /v1/admin.
+      # ADMIN_API_KEY: change-me-to-something-long-and-random
+      #
+      # Read-only credential for the dashboard. Separate from ADMIN_API_KEY on
+      # purpose: the dashboard is a browser app, and whatever key it holds is one
+      # XSS away from being stolen — this one cannot mint API keys.
+      DASHBOARD_API_KEY: local-dashboard-key-change-me
+      # Low limit so you can see rate limiting work without a load generator.
+      RATE_LIMIT_REQUESTS_PER_MINUTE: "20"
+      MOCK_PROVIDER_ENABLED: "true"
+      MOCK_CHUNK_DELAY_MS: "120"
+      # Model aliases and fallback routes are opt-in. To enable them:
+      #   cp openllm.example.yaml openllm.yaml
+      # then uncomment CONFIG_FILE here and the volume below.
+      # CONFIG_FILE: /app/openllm.yaml
+    # volumes:
+    #   - ./openllm.yaml:/app/openllm.yaml:ro
+    ports:
+      - "${GATEWAY_PORT:-4000}:4000"
+    depends_on:
+      # Without `service_healthy` the gateway boots into a connection-refused
+      # loop while Postgres is still initialising.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Liveness only — matches what /health actually means. Node 24 has global
+      # fetch, so this needs no curl or wget in the image.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    # Give the drain + teardown sequence room to finish before Docker SIGKILLs.
+    # Must exceed SHUTDOWN_DRAIN_MS + SHUTDOWN_TIMEOUT_MS.
+    stop_grace_period: 25s
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard.Dockerfile
+    environment:
+      # nginx proxies /v1 here, so the browser is same-origin with the API and
+      # no CORS configuration is needed anywhere.
+      GATEWAY_URL: http://gateway:4000
+    ports:
+      - "${DASHBOARD_PORT:-3000}:80"
+    depends_on:
+      gateway:
+        condition: service_started
+    restart: unless-stopped
+
+  # Optional (spec §19): `docker compose up` skips this entirely.
+  # Start it with: docker compose --profile ollama up
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  ollama-data:

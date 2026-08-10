@@ -1,0 +1,36 @@
+{
+  "name": "@openllm/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "tsx watch --clear-screen=false src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -b",
+    "typecheck": "tsc -b && tsc -p tsconfig.test.json",
+    "clean": "rm -rf dist",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "key:create": "tsx src/cli/create-key.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@openllm/core": "workspace:*",
+    "drizzle-orm": "^0.38.0",
+    "fastify": "^5.2.0",
+    "fastify-type-provider-zod": "^7.0.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "drizzle-kit": "^0.30.0",
+    "pino-pretty": "^13.0.0",
+    "tsx": "^4.19.2"
+  },
+  "license": "Apache-2.0"
+}

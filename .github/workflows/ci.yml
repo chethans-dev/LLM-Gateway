@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Spec §21: the entire suite must be runnable by a contributor with no
+  # provider accounts. Nothing in this file sets a provider API key, and that
+  # absence is the assertion.
+  CI: "true"
+
+jobs:
+  check:
+    name: Typecheck, lint, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Builds the workspace in dependency order, so @openllm/core exists before
+      # anything that imports it.
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test:coverage
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+
+  dashboard:
+    name: Dashboard build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # A dashboard that does not compile is a broken deploy nobody notices
+      # until the image build fails.
+      - run: pnpm --filter @openllm/dashboard typecheck
+      - run: pnpm --filter @openllm/dashboard build
+
+  integration:
+    name: Integration + end-to-end
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: openllm
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d openllm"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      # Covers the real datastores, the migrator, the CLI as a spawned process,
+      # and the end-to-end suite that drives the gateway over an actual socket.
+      - run: pnpm test:integration
+        env:
+          INTEGRATION_TESTS: "1"
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/openllm
+          REDIS_URL: redis://localhost:6379
+      # Suites share one database, so each scopes its own rows. Running twice
+      # proves that scoping holds rather than passing by luck of ordering.
+      - run: pnpm test:integration
+        env:
+          INTEGRATION_TESTS: "1"
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/openllm
+          REDIS_URL: redis://localhost:6379
+
+  compose:
+    name: Docker Compose smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build
+
+      - name: Gateway becomes ready
+        run: |
+          for _ in $(seq 1 60); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/ready)" = "200" ]; then
+              echo "gateway ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "gateway never became ready"; docker compose logs gateway; exit 1
+
+      - name: Quickstart request works with no API keys configured
+        run: |
+          body=$(curl -sf http://localhost:4000/v1/chat/completions \
+            -H 'content-type: application/json' \
+            -d '{"model":"mock/echo","messages":[{"role":"user","content":"ci smoke"}]}')
+          echo "$body"
+          echo "$body" | grep -q '"object":"chat.completion"'
+          echo "$body" | grep -q 'ci smoke'
+
+      - name: Streaming terminates with [DONE]
+        run: |
+          out=$(curl -sfN http://localhost:4000/v1/chat/completions \
+            -H 'content-type: application/json' \
+            -d '{"model":"mock/echo","stream":true,"messages":[{"role":"user","content":"stream"}]}')
+          echo "$out" | tail -3
+          echo "$out" | grep -q 'data: \[DONE\]'
+
+      - name: Dashboard serves the SPA and proxies the API
+        run: |
+          curl -sf http://localhost:3000/ | grep -q '<div id="root">'
+          curl -sf "http://localhost:3000/v1/admin/stats/summary?window=1h" \
+            -H 'authorization: Bearer local-dashboard-key-change-me' | grep -q 'total_requests'
+
+      - name: Liveness must not depend on Redis
+        run: |
+          docker compose stop redis
+          sleep 3
+          ready=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/ready)
+          health=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/health)
+          echo "ready=$ready health=$health"
+          [ "$ready" = "503" ] && [ "$health" = "200" ]
+
+      - name: Requests still flow with Redis down (rate limiter fails open)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/v1/chat/completions \
+            -H 'content-type: application/json' \
+            -d '{"model":"mock","messages":[{"role":"user","content":"degraded"}]}')
+          echo "status=$code"
+          [ "$code" = "200" ]
+          docker compose start redis
+
+      - name: SIGTERM shuts down cleanly
+        run: |
+          docker compose kill -s SIGTERM gateway
+          for _ in $(seq 1 40); do
+            [ -z "$(docker compose ps -q --status running gateway)" ] && break
+            sleep 1
+          done
+          code=$(docker inspect -f '{{.State.ExitCode}}' "$(docker compose ps -aq gateway)")
+          docker compose logs gateway | tail -20
+          echo "exit code: $code"
+          [ "$code" = "0" ]
+
+      - if: always()
+        run: docker compose down -v

@@ -1,0 +1,119 @@
+# OpenLLM Gateway — model aliases and fallback routes (spec §7, §8)
+#
+#   cp openllm.example.yaml openllm.yaml
+#
+# The gateway picks up ./openllm.yaml automatically. Point it elsewhere with
+# CONFIG_FILE=/etc/openllm/routes.yaml — and note that an explicitly configured
+# file which does not exist is a startup error, not a warning.
+#
+# ---------------------------------------------------------------------------
+# There is deliberately NO way to put an API key in this file.
+#
+# Config files get committed; keys in them get committed with them. Credentials
+# come from the environment, which is what every secret manager and orchestrator
+# already injects. Structure lives here.
+# ---------------------------------------------------------------------------
+
+providers:
+  # `enabled` can only turn something OFF that the environment already made
+  # possible. Setting `enabled: true` for a provider with no key does nothing —
+  # "enabled but unable to authenticate" is not a state worth expressing.
+  #
+  # Useful for taking a provider out of rotation without touching secrets.
+  openai:
+    enabled: true
+  gemini:
+    enabled: true
+  anthropic:
+    enabled: true
+  ollama:
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# Pricing (spec §16), in USD per MILLION tokens.
+#
+# In config rather than in code because provider prices change and nobody should
+# need a redeploy to correct a cost figure. Merged over small built-in defaults;
+# your entries win outright.
+#
+# Keys match a model exactly or by prefix, so `gpt-4.1-mini` also covers
+# `gpt-4.1-mini-2025-04-14` without an entry per dated snapshot.
+#
+# THESE NUMBERS ARE YOURS TO MAINTAIN. Take them from your provider's pricing
+# page. A model with no entry records NULL cost — never zero, because "we don't
+# know" and "it was free" are different statements.
+#
+# Costs are labelled estimates throughout, and they are: provider billing has
+# cached-input discounts, batch rates, reasoning-token rules and negotiated
+# pricing that this model does not capture.
+# ---------------------------------------------------------------------------
+# pricing:
+#   gpt-4.1-mini:
+#     input: 0.40
+#     output: 1.60
+#   claude-sonnet-4:
+#     input: 3.00
+#     output: 15.00
+
+# ---------------------------------------------------------------------------
+# Aliases (Level 2). A name mapped to one or more models.
+#
+# Clients send `model: "fast"` and the gateway decides what that means today.
+# Changing providers becomes a config change rather than a client deploy.
+# ---------------------------------------------------------------------------
+models:
+  fast:
+    - gemini-2.5-flash
+    - gpt-4.1-mini
+
+  local:
+    - ollama/qwen3
+
+# ---------------------------------------------------------------------------
+# Routes (Level 3). The same idea with an explicit strategy.
+#
+# A name may appear under `models` OR `routes`, never both — defining it twice
+# is rejected at startup rather than silently resolved one way.
+#
+# Targets are tried in order. The gateway moves to the next one only when the
+# failure is something a different provider could plausibly fix: rate limits,
+# outages, timeouts, unknown models, bad credentials. A malformed request fails
+# identically everywhere, so it is returned immediately rather than replayed —
+# otherwise one bad request becomes four charges for four identical 400s.
+#
+# Every model here is resolved at BOOT. A model the gateway cannot route to any
+# provider stops startup, rather than 404ing the first time someone uses the
+# alias. (It validates that a provider can be determined, not that the model
+# exists — checking that would make startup depend on every provider being up.)
+# ---------------------------------------------------------------------------
+routes:
+  balanced:
+    strategy: fallback
+    models:
+      - gpt-4.1-mini
+      - claude-sonnet-4
+      - gemini-2.5-flash
+
+  # Round-robin, least-latency, lowest-cost and reliability-weighted strategies
+  # are designed for but not implemented. `fallback` is the only value today.
+
+# ---------------------------------------------------------------------------
+# Testing your routing without spending credits
+#
+# The mock provider takes its behaviour from the model name, so a fallback chain
+# is verifiable end to end with no API keys:
+#
+#   routes:
+#     demo:
+#       strategy: fallback
+#       models:
+#         - mock/rate-limited   # fails with a retryable 429 → falls over
+#         - mock/echo           # succeeds, returning your prompt back
+#
+#   curl localhost:4000/v1/chat/completions \
+#     -H 'content-type: application/json' \
+#     -d '{"model":"demo","messages":[{"role":"user","content":"hello"}]}'
+#
+# The response carries `x-openllm-provider` and, when a fallback fired,
+# `x-openllm-attempts`.
+# ---------------------------------------------------------------------------
