@@ -211,4 +211,12 @@ const envObjectSchema = z.object({
 
 export const envSchema = z.preprocess(blankToUndefined, envObjectSchema);
 
+/**
+ * Every variable the gateway reads.
+ *
+ * Exported so a test can assert the documentation lists all of them — reaching
+ * into Zod's internals to recover this would break on any minor version.
+ */
+export const ENV_VAR_NAMES: readonly string[] = Object.keys(envObjectSchema.shape);
+
 export type Env = z.infer<typeof envSchema>;

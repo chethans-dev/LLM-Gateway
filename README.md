@@ -93,6 +93,142 @@ Ollama is optional and off by default:
 docker compose --profile ollama up
 ```
 
+---
+
+## Architecture
+
+A **modular monolith**: one deployable process with deliberate internal boundaries.
+
+```text
+                            ┌─────────────────────────┐
+  client ───────────────────│  Fastify HTTP API       │
+  (OpenAI-compatible SDK)   │                         │
+                            │  request context        │  requestId / traceId
+                            │  authentication         │  API key → hash lookup
+                            │  rate limiting          │  Redis token bucket
+                            │  validation             │  Zod
+                            └───────────┬─────────────┘
+                                        │  ChatRequest
+                            ┌───────────▼─────────────┐
+                            │  Router                 │
+                            │                         │
+                            │  model resolution       │  explicit → alias → route
+                            │  fallback               │  a DIFFERENT provider
+                            │  retry                  │  the SAME provider
+                            │  timeouts               │  per call + per request
+                            └───────────┬─────────────┘
+                                        │  provider-native
+                            ┌───────────▼─────────────┐
+                            │  LLMProvider            │
+                            │  OpenAI · Anthropic ·   │
+                            │  Gemini · Ollama · Mock │
+                            └───────────┬─────────────┘
+                                        │
+              ┌─────────────────────────┴───────────────────────┐
+              │                                                 │
+      ┌───────▼────────┐                              ┌─────────▼────────┐
+      │  Redis         │                              │  PostgreSQL      │
+      │  rate limits   │                              │  api_keys        │
+      │  response cache│                              │  requests        │
+      │  provider health│                             │                  │
+      └────────────────┘                              └──────────────────┘
+```
+
+### Why a monolith
+
+Every layer above shares one request lifecycle and one latency budget. Splitting routing from
+providers across a network boundary would add a hop, a serialization step and a new failure mode
+to a path whose entire job is being a thin, reliable proxy.
+
+The boundaries exist so extraction is *possible* later — not because it is planned. That is the
+only justification for a boundary at this stage.
+
+### The request path
+
+```text
+POST /v1/chat/completions
+  │
+  ├─ normalize            OpenAI body → internal ChatRequest
+  ├─ resolve              "fast" → [gemini-2.5-flash, gpt-4.1-mini]
+  │
+  └─ for each target:                        ← fallback  (failoverable errors)
+       └─ for each attempt on that target:   ← retry     (retryable errors)
+            └─ one provider call             ← PROVIDER_TIMEOUT_MS
+     ...all bounded by                       ← REQUEST_TIMEOUT_MS
+  │
+  ├─ denormalize          provider response → OpenAI body
+  └─ record               metadata only, buffered off the request path
+```
+
+Retries are exhausted on a target before moving on, so a single-target route still recovers from
+a blip and a multi-target route does not skip past a provider that was one retry from succeeding.
+
+### The error model is the load-bearing piece
+
+Every provider translates its native failures into one taxonomy, and the router makes decisions
+from **two independent flags** — never from a provider's status codes or message text:
+
+| Code | Retry same provider | Try a different one | Why |
+|---|---|---|---|
+| `INVALID_REQUEST` | no | no | Fails identically everywhere |
+| `INTERNAL_ERROR` | no | no | Our bug — same result anywhere |
+| `AUTHENTICATION_ERROR` | no | **yes** | Our key won't fix itself; another provider has its own |
+| `MODEL_NOT_FOUND` | no | **yes** | Same provider still lacks it; another may have an equivalent |
+| `TIMEOUT` | no | **yes** | Hammering a slow provider rarely helps |
+| `RATE_LIMITED` | **yes** | **yes** | Transient; others likely have capacity |
+| `PROVIDER_ERROR` | **yes** | **yes** | Provider-side 5xx, often transient |
+| `UNAVAILABLE` | **yes** | **yes** | DNS failure, connection refused, circuit open |
+
+Collapsing these into one flag forces a choice between failing requests a configured fallback
+could have served, and burning attempts on errors that cannot improve.
+
+### Everything degrades toward staying up
+
+| Dependency fails | What happens |
+|---|---|
+| Redis (rate limiter) | requests allowed, `x-openllm-ratelimit-degraded: true`, warning logged |
+| Redis (cache) | treated as a miss |
+| Redis (circuit breaker) | treated as closed |
+| Postgres (request recording) | metrics dropped, request unaffected |
+| Postgres / Redis (readiness) | `/ready` → 503, `/health` stays 200 |
+
+These are cost and latency optimisations; none is worth being the reason the gateway is down.
+The rate limiter's degraded state is surfaced in a header *and* a log, because silently not
+limiting is how an unexpected bill arrives.
+
+### Two invariants
+
+**Prompts and completions are never persisted.** Not "not populated" — the `requests` table has
+no column for them, and a test asserts none exists so the guarantee survives a future migration.
+
+**API keys are stored only as hashes**, and the raw key is returned exactly once at creation.
+No endpoint can print it again.
+
+### Repository layout
+
+```text
+apps/gateway/src/
+  config/          env schema → typed AppConfig (the only place process.env is read)
+  http/            server builder, plugins, routes, SSE
+  routing/         model resolution, route table, retry, fallback, deadlines
+  providers/       LLMProvider + adapters, transport, stream parsers
+  redis/           rate limiter, response cache, circuit breaker
+  observability/   logger, pricing, request recorder + repository
+  auth/            key generation, hashing, repository
+  db/              Drizzle schema + migrator
+
+apps/dashboard/    operator UI (React, Vite, Tailwind, TanStack Query)
+packages/core/     shared with the dashboard: error taxonomy, correlation IDs, provider ids
+docker/            gateway and dashboard images, nginx config
+docs/              PLAN.md (decisions + phase history), architecture.md, configuration.md
+```
+
+`packages/core` holds only what the gateway **and** the dashboard both import — a package earns
+its existence by having two consumers.
+
+**Deeper detail, and the reasoning behind each decision:**
+[docs/architecture.md](docs/architecture.md) · [docs/PLAN.md](docs/PLAN.md)
+
 ## Local development
 
 Requires Node 24 (see `.nvmrc`) and pnpm 10.
@@ -473,17 +609,6 @@ fails the process at startup — with *every* problem reported at once, not one 
 
 See [docs/configuration.md](docs/configuration.md) for the full reference and
 [.env.example](.env.example) for a working starting point.
-
-## Architecture
-
-See [docs/architecture.md](docs/architecture.md).
-
-```text
-apps/gateway      the service (HTTP, config, infra, routing, providers)
-packages/core     types shared with the dashboard (error model, correlation IDs)
-docker/           container build
-docs/             plan, architecture, configuration
-```
 
 ## Contributing
 
