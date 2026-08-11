@@ -470,3 +470,109 @@ describe("failures record which provider was attempted", () => {
     });
   });
 });
+
+describe("a streamed failure is recorded like any other failure", () => {
+  /**
+   * The bug these cover: the streaming path recorded itself from a `finally`
+   * block that ran BEFORE the rethrown error reached the error handler. It wrote
+   * a hardcoded 500 with no error code and no provider, then marked the draft
+   * recorded — so the correct values the handler set microseconds later were
+   * discarded, and `onResponse` skipped the row as already written.
+   *
+   * The client always got the right status. Only the history was wrong, which is
+   * the worst place for it to be wrong: the dashboard showed 5xx that never
+   * happened and filed every streamed failure under `unrouted`.
+   *
+   * Nothing asserted what a STREAM records, only what the client receives, which
+   * is exactly how it survived.
+   */
+  async function streamOf(model: string) {
+    const recorder = collectingRecorder();
+    app = await build(recorder);
+
+    const response = await post(app, {
+      model,
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    });
+
+    return { response, record: recorder.records[0] };
+  }
+
+  it.each([
+    ["mock/rate-limited", 429, "RATE_LIMITED"],
+    ["mock/model-not-found", 404, "MODEL_NOT_FOUND"],
+    ["mock/auth-error", 401, "AUTHENTICATION_ERROR"],
+    ["mock/invalid", 400, "INVALID_REQUEST"],
+  ])(
+    "records %s as %i, matching what the client was told",
+    async (model, expectedStatus, expectedCode) => {
+      const { response, record } = await streamOf(model);
+
+      // The client's view was always correct; the record has to agree with it.
+      expect(response.statusCode).toBe(expectedStatus);
+      expect(record?.httpStatus).toBe(expectedStatus);
+      expect(record?.errorCode).toBe(expectedCode);
+      expect(record?.status).toBe("error");
+      expect(record?.streamed).toBe(true);
+    },
+  );
+
+  it("attributes the failure to a provider rather than dumping it in unrouted", async () => {
+    // "Which provider is failing?" is the single most useful question the
+    // dashboard answers, and a null provider silently removes a request from it.
+    const { record } = await streamOf("mock/server-error");
+
+    expect(record?.provider).toBe("mock");
+  });
+
+  it("agrees with the non-streamed record for the same failure", async () => {
+    // The two paths diverging is the whole defect. Comparing them directly means
+    // a future change to one has to keep the other honest.
+    const streamed = await streamOf("mock/rate-limited");
+
+    const recorder = collectingRecorder();
+    app = await build(recorder);
+    await post(app, { model: "mock/rate-limited", messages: [{ role: "user", content: "hi" }] });
+    const buffered = recorder.records[0];
+
+    expect(streamed.record?.httpStatus).toBe(buffered?.httpStatus);
+    expect(streamed.record?.errorCode).toBe(buffered?.errorCode);
+    expect(streamed.record?.status).toBe(buffered?.status);
+    expect(streamed.record?.provider).toBe(buffered?.provider);
+  });
+
+  it("records exactly one row, not two", async () => {
+    // Both the streaming path and onResponse can reach the recorder; `recorded`
+    // is what keeps that from double-counting every streamed request.
+    const recorder = collectingRecorder();
+    app = await build(recorder);
+
+    await post(app, {
+      model: "mock/rate-limited",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    });
+
+    expect(recorder.records).toHaveLength(1);
+  });
+
+  it("still records a SUCCESSFUL stream as a 200", async () => {
+    // The fix must not have moved success off the hijacked path, where
+    // onResponse genuinely never fires.
+    const recorder = collectingRecorder();
+    app = await build(recorder);
+
+    await post(app, {
+      model: "mock/echo",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    });
+
+    expect(recorder.records[0]).toMatchObject({
+      status: "success",
+      httpStatus: 200,
+      streamed: true,
+    });
+  });
+});

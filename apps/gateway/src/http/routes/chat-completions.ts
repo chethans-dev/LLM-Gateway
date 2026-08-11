@@ -284,6 +284,12 @@ async function handleStream(
       "chat completion stream failed",
     );
 
+    // The response really was a 200 — bytes had already gone out — but the
+    // request failed, and a history that files it under "success" makes a
+    // truncated stream invisible to the success rate it should be dragging down.
+    request.observation.errorCode = normalized.code;
+    request.observation.failed = true;
+
     if (writer.isWritable) {
       await writer.send(toOpenAIErrorEnvelope(normalized, request.id)).catch(() => {
         // The client is already gone; nothing left to report to.
@@ -297,8 +303,22 @@ async function handleStream(
     request.observation.providerCalls = stream.callCount();
     writer?.end();
 
-    // Hijacking means onResponse never fires, so the streaming path records
-    // itself. `recorded` keeps it idempotent either way.
-    options.observation?.(request, writer === undefined ? 500 : 200);
+    if (writer !== undefined) {
+      // Hijacked, so onResponse never fires and this path records itself. The
+      // bytes went out under a 200 whatever happened afterwards; `failed` above
+      // is what distinguishes a truncated stream from a complete one.
+      options.observation?.(request, 200);
+    } else if (controller.signal.aborted) {
+      // Nobody left to answer and nothing will be thrown, so without this the
+      // request disappears from history entirely. 499 is nginx's convention for
+      // "client closed request": not our failure, but not a success either.
+      options.observation?.(request, 499);
+    }
+    // Otherwise an error is on its way out. Recording it HERE was the bug: this
+    // block runs before the error handler fills in the normalized code and
+    // provider, so it wrote a hardcoded 500 with neither, then marked the draft
+    // recorded — discarding the correct values set microseconds later. Left
+    // alone, the request takes the same path as a non-streamed failure and is
+    // recorded by onResponse with the real status.
   }
 }

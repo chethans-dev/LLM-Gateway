@@ -25,6 +25,16 @@ export interface ObservationDraft {
   streamed: boolean;
   usage: TokenUsage | undefined;
   errorCode: LLMErrorCode | undefined;
+  /**
+   * Failed despite a non-error status.
+   *
+   * Only a stream can be in this position: once the first chunk is written the
+   * status is fixed at 200, so a provider failing halfway through is reported as
+   * an event inside an otherwise-successful response. Deriving status from the
+   * HTTP code alone would file that under "success" and hide truncated streams
+   * from the success rate they should be dragging down.
+   */
+  failed: boolean;
   /** Set once written, so the hijacked streaming path is not recorded twice. */
   recorded: boolean;
 }
@@ -73,6 +83,7 @@ export function registerObservation(
       streamed: false,
       usage: undefined,
       errorCode: undefined,
+      failed: false,
       recorded: false,
     };
     done();
@@ -122,7 +133,9 @@ export function recordObservation(
     route: draft.route,
     provider: draft.provider,
     model: draft.model,
-    status: httpStatus < 400 ? "success" : "error",
+    // `failed` covers the streamed case where the status is pinned at 200
+    // because bytes were already on the wire when the provider broke.
+    status: httpStatus < 400 && !draft.failed ? "success" : "error",
     errorCode: draft.errorCode,
     httpStatus,
     latencyMs: Math.round(performance.now() - draft.startedAt),
