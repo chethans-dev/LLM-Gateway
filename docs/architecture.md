@@ -239,9 +239,32 @@ API keys.
 lives in `src/api/`; components receive data and render it. Formatting rules — most importantly
 "null renders as —, never as 0" — live in `format.ts` so they are stated once and testable.
 
-**Dense tables, no charts.** Spec §18 asks for useful infrastructure information over polish.
-The questions this answers are "is it working", "what is it costing" and "what happened to that
-request", none of which a graph answers better than a number.
+**Dense tables, and exactly one chart.** Spec §18 asks for useful infrastructure information
+over polish. "Is it working", "what is it costing" and "what happened to that request" are all
+answered better by a number than by a graph, so they are numbers.
+
+The one graph earns its place by answering the question a number cannot: **is it getting
+worse?** A 96% success rate reads identically whether the failures are spread evenly across the
+window or all arrived in the last four minutes, and those are opposite situations. It is a
+stacked column of successes and errors per time bucket, served by `/v1/admin/stats/timeseries`.
+
+Two details in it are deliberate. The gateway returns a gap-filled bucket spine, so an idle
+period renders as a run of zeros rather than vanishing — a chart that silently omits empty
+buckets draws an outage as a narrower, healthier-looking chart. And errors are drawn on the
+baseline rather than stacked on top, because only the baseline-anchored segment of a stack can
+be compared across columns by eye.
+
+The colors are not the obvious green/red pair. Measured under deuteranopia simulation, that
+pair separates by ΔE 4.1 — for a red-green colorblind reader the two halves of every bar are
+the same color. The blue actually used measures 25.7 against the same red. Identity never rests
+on hue alone regardless: there is a legend, a labelled tooltip, and a data table under every
+chart.
+
+Geometry lives in `chart-geometry.ts` as pure functions, so the failures that are invisible in
+a screenshot taken on a good day — a bar overflowing its plot only when errors spike, a single
+error rounded away to nothing — are unit-tested rather than eyeballed. There is no charting
+library: one stacked column chart is about 200 lines, and a dependency shipping a canvas
+renderer, a locale bundle and its own theming system to draw it is not a trade worth making.
 
 ### Request recording (`src/observability`)
 

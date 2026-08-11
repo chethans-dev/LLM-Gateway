@@ -297,8 +297,8 @@ to assert a 429 is worse.
 | `GET /ready` | **Readiness.** Should traffic be routed here? Checks Postgres and Redis. |
 | `POST /v1/chat/completions` | OpenAI-compatible chat, buffered or streamed (`stream: true`). |
 | `POST`/`GET`/`DELETE /v1/admin/keys` | Key management. Requires `ADMIN_API_KEY`. |
-| `GET /v1/admin/stats/*` | Summary and per-provider statistics. Read-only credential. |
-| `GET /v1/admin/requests[/:id]` | Recent requests and request detail. Read-only credential. |
+| `GET /v1/admin/stats/*` | Summary, per-provider, per-bucket time series, filter facets. Read-only credential. |
+| `GET /v1/admin/requests[/:id]` | Recent requests and request detail. Filterable by `status`, `provider` and `model`; paged with an opaque `cursor`. Read-only credential. |
 | `GET /v1/admin/traces/:traceId` | Every request sharing a trace. Read-only credential. |
 
 ### Model aliases and fallback
@@ -367,6 +367,18 @@ docker compose up      # dashboard on http://localhost:3000
 Totals, success rate, average **and p95** latency, tokens, estimated cost, a provider
 breakdown, recent requests and per-request detail. p95 is there because an average hides the
 tail, and the tail is what people mean when they say the gateway feels slow.
+
+Above the tables, one chart: requests per time bucket, split into successes and errors. It is
+there because a success rate cannot tell you whether the failures are spread across the window
+or all arrived in the last four minutes. Empty buckets are drawn rather than skipped, so an
+idle period looks idle instead of disappearing.
+
+The request table filters by status, provider and model — the options are the values that
+actually served traffic in the selected window, not everything configured — and pages through
+history with a "Load more" that is immune to rows shifting underneath it. Trace IDs are
+copyable in one click, because a trace ID is only ever useful somewhere else. Rows are
+reachable by keyboard, and auto-refresh shows its state, pauses on demand, and stops on its own
+once you page back into history.
 
 It asks for `DASHBOARD_API_KEY`, which is **read-only** — the gateway will not accept it for
 key management. That separation is deliberate: whatever credential a browser app holds is one
