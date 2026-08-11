@@ -71,7 +71,12 @@ services:
       # Read-only credential for the dashboard. Separate from ADMIN_API_KEY on
       # purpose: the dashboard is a browser app, and whatever key it holds is one
       # XSS away from being stolen — this one cannot mint API keys.
-      DASHBOARD_API_KEY: local-dashboard-key-change-me
+      #
+      # Interpolated, so setting DASHBOARD_API_KEY in .env actually takes effect.
+      # A bare literal here would silently win over .env — `environment:` beats
+      # `env_file:` in compose — and leave you typing a credential you configured
+      # yourself into a login that rejects it.
+      DASHBOARD_API_KEY: ${DASHBOARD_API_KEY:-local-dashboard-key-change-me}
       # Low limit so you can see rate limiting work without a load generator.
       RATE_LIMIT_REQUESTS_PER_MINUTE: "20"
       MOCK_PROVIDER_ENABLED: "true"
