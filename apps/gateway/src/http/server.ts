@@ -9,6 +9,7 @@ import type { ApiKeyRepository } from "../auth/api-key-repository.js";
 import type { RateLimiter } from "../redis/rate-limiter.js";
 import type { RequestRecorder } from "../observability/request-recorder.js";
 import type { RequestRepository } from "../observability/request-repository.js";
+import type { ProviderRegistry } from "../providers/registry.js";
 import type { Logger } from "../observability/logger.js";
 import { createActiveStreams, type ActiveStreams } from "./active-streams.js";
 import { registerAuthentication } from "./plugins/authentication.js";
@@ -19,6 +20,7 @@ import { registerRequestContext } from "./plugins/request-context.js";
 import { registerAdminKeyRoutes } from "./routes/admin-keys.js";
 import { registerAdminStatsRoutes } from "./routes/admin-stats.js";
 import { registerChatCompletionRoutes } from "./routes/chat-completions.js";
+import { registerModelRoutes } from "./routes/models.js";
 import {
   createReadinessProbe,
   registerHealthRoutes,
@@ -47,6 +49,11 @@ export interface ServerDependencies {
   readonly recorder?: RequestRecorder;
   /** Absent means the dashboard's stats endpoints are not registered. */
   readonly requestRepository?: RequestRepository;
+  /**
+   * Required for `/v1/models`, which lists only models the gateway holds a
+   * credential for. Absent means the listing is not registered.
+   */
+  readonly registry?: ProviderRegistry;
 }
 
 /**
@@ -155,6 +162,12 @@ export async function buildServer(deps: ServerDependencies): Promise<FastifyInst
           }
         : {}),
     });
+
+    // Needs both: the route table names what is configured, the registry says
+    // which of it we hold a credential for.
+    if (deps.registry !== undefined) {
+      registerModelRoutes(app, { routes: deps.chatService.routes, registry: deps.registry });
+    }
   }
 
   // Probe endpoints are hit continuously by the orchestrator. Logging them

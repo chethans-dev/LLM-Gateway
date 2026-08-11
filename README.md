@@ -296,6 +296,7 @@ to assert a 429 is worse.
 | `GET /health` | **Liveness.** Is this process wedged? Checks nothing external. |
 | `GET /ready` | **Readiness.** Should traffic be routed here? Checks Postgres and Redis. |
 | `POST /v1/chat/completions` | OpenAI-compatible chat, buffered or streamed (`stream: true`). |
+| `GET /v1/models[/:id]` | OpenAI-compatible model listing — the aliases and routes you configured, plus the models they resolve to, filtered to providers you hold a credential for. **Not exhaustive:** any name a provider prefix matches is routable whether or not it appears here, and with no `openllm.yaml` the list is empty. Enumerating every provider's catalogue would make this endpoint's availability depend on all of them at once. |
 | `POST`/`GET`/`DELETE /v1/admin/keys` | Key management. Requires `ADMIN_API_KEY`. |
 | `GET /v1/admin/stats/*` | Summary, per-provider, per-bucket time series, filter facets. Read-only credential. |
 | `GET /v1/admin/requests[/:id]` | Recent requests and request detail. Filterable by `status`, `provider` and `model`; paged with an opaque `cursor`. Read-only credential. |

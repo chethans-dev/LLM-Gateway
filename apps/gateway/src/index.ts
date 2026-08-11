@@ -197,6 +197,7 @@ async function main(): Promise<void> {
     ...(rateLimiter !== undefined ? { rateLimiter } : {}),
     ...(recorder !== undefined ? { recorder } : {}),
     requestRepository,
+    registry,
   });
 
   // Registration order IS teardown order: stop accepting work first, then close
