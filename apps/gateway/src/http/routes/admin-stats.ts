@@ -162,6 +162,54 @@ export function registerAdminStatsRoutes(
   );
 
   typed.get(
+    "/v1/admin/stats/timeseries",
+    {
+      schema: {
+        querystring: windowQuery,
+        response: {
+          200: z.object({
+            bucket_seconds: z.number(),
+            data: z.array(
+              z.object({
+                bucket_start: z.string(),
+                total: z.number(),
+                errors: z.number(),
+              }),
+            ),
+          }),
+        },
+      },
+    },
+    async (request) => {
+      const series = await repository.timeseries(request.query.window as StatsWindow);
+      return {
+        bucket_seconds: series.bucketSeconds,
+        data: series.buckets.map((bucket) => ({
+          bucket_start: bucket.bucketStart.toISOString(),
+          total: bucket.total,
+          errors: bucket.errors,
+        })),
+      };
+    },
+  );
+
+  typed.get(
+    "/v1/admin/stats/facets",
+    {
+      schema: {
+        querystring: windowQuery,
+        response: {
+          200: z.object({ providers: z.array(z.string()), models: z.array(z.string()) }),
+        },
+      },
+    },
+    async (request) => {
+      const facets = await repository.facets(request.query.window as StatsWindow);
+      return { providers: [...facets.providers], models: [...facets.models] };
+    },
+  );
+
+  typed.get(
     "/v1/admin/requests",
     {
       schema: {
@@ -170,16 +218,37 @@ export function registerAdminStatsRoutes(
           // Capped: an unbounded limit is a way to make the gateway read its
           // whole history into memory on somebody's behalf.
           limit: z.coerce.number().int().min(1).max(200).default(50),
+          status: z.enum(["success", "error"]).optional(),
+          provider: z.string().min(1).max(100).optional(),
+          model: z.string().min(1).max(200).optional(),
+          /** From a previous response's `next_cursor`. */
+          cursor: z.string().min(1).max(200).optional(),
         }),
-        response: { 200: z.object({ data: z.array(requestItemSchema) }) },
+        response: {
+          200: z.object({
+            data: z.array(requestItemSchema),
+            next_cursor: z.string().nullable(),
+          }),
+        },
       },
     },
     async (request) => {
-      const rows = await repository.recent({
-        window: request.query.window as StatsWindow,
-        limit: request.query.limit,
+      const { window, limit, status, provider, model, cursor } = request.query;
+
+      const page = await repository.recent({
+        window: window as StatsWindow,
+        limit,
+        // `exactOptionalPropertyTypes` is on, so an absent filter must be an
+        // absent key rather than an explicit undefined.
+        filters: {
+          ...(status !== undefined ? { status } : {}),
+          ...(provider !== undefined ? { provider } : {}),
+          ...(model !== undefined ? { model } : {}),
+        },
+        cursor: cursor ?? null,
       });
-      return { data: rows.map(toWireItem) };
+
+      return { data: page.items.map(toWireItem), next_cursor: page.nextCursor };
     },
   );
 

@@ -1,4 +1,5 @@
-import { desc, eq, gte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, isNull, sql, type SQL } from "drizzle-orm";
+import { LLMError } from "@openllm/core";
 import type { Database } from "../auth/api-key-repository.js";
 import { requests, type RequestRow } from "../db/schema.js";
 
@@ -21,6 +22,21 @@ const WINDOW_INTERVALS: Record<StatsWindow, string> = {
   "7d": "7 days",
   "30d": "30 days",
 };
+
+/**
+ * Bucket width per window, chosen so every window yields 30–60 points.
+ *
+ * Enough resolution to see a spike, few enough that each bar stays wide enough
+ * to hit with a mouse. Fixed per window rather than derived from the data, so
+ * the same window always looks the same and two screenshots are comparable.
+ */
+const WINDOW_BUCKETS: Record<StatsWindow, { readonly interval: string; readonly seconds: number }> =
+  {
+    "1h": { interval: "1 minute", seconds: 60 },
+    "24h": { interval: "30 minutes", seconds: 1_800 },
+    "7d": { interval: "4 hours", seconds: 14_400 },
+    "30d": { interval: "1 day", seconds: 86_400 },
+  };
 
 export interface StatsSummary {
   readonly totalRequests: number;
@@ -82,14 +98,92 @@ export interface RequestDetail extends RequestListItem {
   readonly outputTokens: number | null;
 }
 
+/** One point on the traffic chart. */
+export interface TimeBucket {
+  readonly bucketStart: Date;
+  readonly total: number;
+  readonly errors: number;
+}
+
+export interface TimeSeries {
+  /** Bucket width, so the client can size bars without re-deriving it. */
+  readonly bucketSeconds: number;
+  readonly buckets: readonly TimeBucket[];
+}
+
+/**
+ * The values a dashboard filter can offer.
+ *
+ * Derived from the traffic in the window rather than from configuration: the
+ * useful question is "which providers actually served anything", and a dropdown
+ * listing configured-but-idle providers only produces empty result sets.
+ */
+export interface RequestFacets {
+  readonly providers: readonly string[];
+  readonly models: readonly string[];
+}
+
+export interface RequestFilters {
+  readonly status?: "success" | "error";
+  /** `unrouted` selects rows that never reached a provider. */
+  readonly provider?: string;
+  readonly model?: string;
+}
+
+export interface RequestPage {
+  readonly items: readonly RequestListItem[];
+  /** Opaque; pass back as `cursor` for the next page. Null at the end. */
+  readonly nextCursor: string | null;
+}
+
 export interface RequestRepository {
   summary(window: StatsWindow): Promise<StatsSummary>;
   byProvider(window: StatsWindow): Promise<readonly ProviderStats[]>;
-  recent(options: { window: StatsWindow; limit: number }): Promise<readonly RequestListItem[]>;
+  /** Bucketed request and error counts, for the traffic chart. */
+  timeseries(window: StatsWindow): Promise<TimeSeries>;
+  /** Distinct providers and models seen in the window, for filter controls. */
+  facets(window: StatsWindow): Promise<RequestFacets>;
+  recent(options: {
+    window: StatsWindow;
+    limit: number;
+    filters?: RequestFilters;
+    cursor?: string | null;
+  }): Promise<RequestPage>;
   /** Accepts the database id or the `req_…` request id. */
   find(id: string): Promise<RequestDetail | undefined>;
   /** Every request sharing a trace, for following one logical operation. */
   byTrace(traceId: string): Promise<readonly RequestListItem[]>;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Keyset pagination, not OFFSET.
+ *
+ * This list is sorted newest-first over a table that is being appended to while
+ * somebody reads it. With OFFSET, a row inserted between page 1 and page 2
+ * pushes everything down and page 2 repeats a row page 1 already showed. A
+ * cursor naming the last row seen is immune to that, and it stays on the
+ * `(created_at desc)` index instead of counting past N rows to discard them.
+ */
+export function encodeCursor(item: { createdAt: Date; id: string }): string {
+  return `${item.createdAt.toISOString()}|${item.id}`;
+}
+
+export function parseCursor(cursor: string): { createdAt: Date; id: string } {
+  const separator = cursor.indexOf("|");
+  const timePart = separator === -1 ? "" : cursor.slice(0, separator);
+  const id = separator === -1 ? "" : cursor.slice(separator + 1);
+  const createdAt = new Date(timePart);
+
+  // Rejected loudly rather than ignored. A cursor silently treated as "start
+  // from the top" makes a paging bug look like duplicated data, which is a much
+  // harder thing to diagnose than a 400.
+  if (timePart === "" || Number.isNaN(createdAt.getTime()) || !UUID_PATTERN.test(id)) {
+    throw LLMError.invalidRequest("Malformed cursor");
+  }
+
+  return { createdAt, id };
 }
 
 /** Postgres returns NUMERIC and COUNT as strings to avoid precision loss. */
@@ -176,15 +270,122 @@ export function createRequestRepository(db: Database): RequestRepository {
       }));
     },
 
-    async recent({ window, limit }): Promise<readonly RequestListItem[]> {
+    async timeseries(window): Promise<TimeSeries> {
+      const bucket = WINDOW_BUCKETS[window];
+      const width = sql.raw(`interval '${bucket.interval}'`);
+
+      // Two steps on purpose. Aggregating first is one index range scan over the
+      // window; generating the bucket spine separately and LEFT JOINing onto it
+      // is what makes an idle period render as a run of zeros instead of
+      // vanishing. A chart that silently omits empty buckets draws an outage as
+      // a narrower-but-healthy chart, which is precisely backwards.
+      const result = await db.execute<Record<string, unknown>>(sql`
+        with counts as (
+          select
+            date_bin(${width}, created_at, timestamptz 'epoch') as bucket_start,
+            count(*)                                   as total,
+            count(*) filter (where status = 'error')   as errors
+          from requests
+          where created_at >= ${since(window)}
+          group by 1
+        ),
+        spine as (
+          select generate_series(
+            date_bin(${width}, now() - ${sql.raw(`interval '${WINDOW_INTERVALS[window]}'`)}, timestamptz 'epoch'),
+            date_bin(${width}, now(), timestamptz 'epoch'),
+            ${width}
+          ) as bucket_start
+        )
+        select
+          spine.bucket_start,
+          coalesce(counts.total, 0)  as total,
+          coalesce(counts.errors, 0) as errors
+        from spine
+        left join counts using (bucket_start)
+        order by spine.bucket_start
+      `);
+
+      return {
+        bucketSeconds: bucket.seconds,
+        buckets: result.rows.map((row) => ({
+          bucketStart: new Date(String(row["bucket_start"])),
+          total: toNumber(row["total"]),
+          errors: toNumber(row["errors"]),
+        })),
+      };
+    },
+
+    async facets(window): Promise<RequestFacets> {
+      // One scan for both lists. `coalesce(model, requested_model)` mirrors what
+      // the table's Model column displays, so every option in the dropdown
+      // matches text a reader can actually see in a row.
+      const result = await db.execute<Record<string, unknown>>(sql`
+        select
+          array_agg(distinct coalesce(provider, 'unrouted'))       as providers,
+          array_agg(distinct coalesce(model, requested_model))     as models
+        from requests
+        where created_at >= ${since(window)}
+      `);
+
+      const row = result.rows[0] ?? {};
+      const toList = (value: unknown): readonly string[] =>
+        Array.isArray(value)
+          ? value.filter((entry): entry is string => typeof entry === "string").sort()
+          : [];
+
+      return { providers: toList(row["providers"]), models: toList(row["models"]) };
+    },
+
+    async recent({ window, limit, filters = {}, cursor = null }): Promise<RequestPage> {
+      const conditions: SQL[] = [
+        gte(requests.createdAt, sql`now() - ${sql.raw(`interval '${WINDOW_INTERVALS[window]}'`)}`),
+      ];
+
+      if (filters.status !== undefined) {
+        conditions.push(eq(requests.status, filters.status));
+      }
+      if (filters.provider !== undefined) {
+        // Matches the `unrouted` bucket the provider breakdown reports: those
+        // are the requests that failed before a provider was chosen, and being
+        // able to list them is most of the point of the filter.
+        conditions.push(
+          filters.provider === "unrouted"
+            ? isNull(requests.provider)
+            : eq(requests.provider, filters.provider),
+        );
+      }
+      if (filters.model !== undefined) {
+        conditions.push(
+          sql`coalesce(${requests.model}, ${requests.requestedModel}) = ${filters.model}`,
+        );
+      }
+      if (cursor !== null) {
+        const position = parseCursor(cursor);
+        // Row comparison, so the tiebreak on id is part of the same index-ordered
+        // predicate. Two requests can share a timestamp; without the tiebreak one
+        // of them is dropped at every page boundary.
+        conditions.push(
+          sql`(${requests.createdAt}, ${requests.id}) < (${position.createdAt.toISOString()}::timestamptz, ${position.id}::uuid)`,
+        );
+      }
+
+      // One extra row is the cheapest way to know whether a next page exists
+      // without a second COUNT query over the same predicate.
       const rows = await db
         .select()
         .from(requests)
-        .where(gte(requests.createdAt, sql`now() - ${sql.raw(`interval '${WINDOW_INTERVALS[window]}'`)}`))
-        .orderBy(desc(requests.createdAt))
-        .limit(limit);
+        .where(and(...conditions))
+        .orderBy(desc(requests.createdAt), desc(requests.id))
+        .limit(limit + 1);
 
-      return rows.map(toListItem);
+      const hasMore = rows.length > limit;
+      const page = (hasMore ? rows.slice(0, limit) : rows).map(toListItem);
+      const last = page[page.length - 1];
+
+      return {
+        items: page,
+        nextCursor: hasMore && last !== undefined ? encodeCursor(last) : null,
+      };
     },
 
     async find(id): Promise<RequestDetail | undefined> {

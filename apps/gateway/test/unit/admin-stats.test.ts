@@ -71,13 +71,30 @@ const providers: ProviderStats[] = [
   },
 ];
 
-function fakeRepository(): RequestRepository {
+/** Captures what the route passed down, so query-param plumbing is assertable. */
+type RecentOptions = Parameters<RequestRepository["recent"]>[0];
+const recentCalls: RecentOptions[] = [];
+const lastRecentCall = (): RecentOptions | undefined => recentCalls[recentCalls.length - 1];
+
+function fakeRepository(overrides: Partial<RequestRepository> = {}): RequestRepository {
   return {
     summary: async () => summary,
     byProvider: async () => providers,
-    recent: async () => [item],
+    timeseries: async () => ({
+      bucketSeconds: 1_800,
+      buckets: [
+        { bucketStart: new Date("2026-08-01T12:00:00Z"), total: 10, errors: 2 },
+        { bucketStart: new Date("2026-08-01T12:30:00Z"), total: 0, errors: 0 },
+      ],
+    }),
+    facets: async () => ({ providers: ["mock", "unrouted"], models: ["echo", "fast"] }),
+    recent: async (options) => {
+      recentCalls.push(options);
+      return { items: [item], nextCursor: null };
+    },
     find: async (id) => (id === item.id || id === item.requestId ? detail : undefined),
     byTrace: async () => [item],
+    ...overrides,
   };
 }
 
@@ -91,7 +108,13 @@ const noKeys: ApiKeyRepository = {
   touch: () => {},
 };
 
-async function build(options: { adminApiKey?: string; dashboardApiKey?: string } = {}) {
+async function build(
+  options: {
+    adminApiKey?: string;
+    dashboardApiKey?: string;
+    repository?: RequestRepository;
+  } = {},
+) {
   const config = createTestConfig({
     auth: {
       required: false,
@@ -107,7 +130,7 @@ async function build(options: { adminApiKey?: string; dashboardApiKey?: string }
     checks: [],
     version: "0.1.0-test",
     apiKeys: noKeys,
-    requestRepository: fakeRepository(),
+    requestRepository: options.repository ?? fakeRepository(),
   });
 }
 
@@ -296,6 +319,146 @@ describe("stats payloads", () => {
         })
       ).statusCode,
     ).toBe(404);
+  });
+});
+
+describe("the traffic time series", () => {
+  it("reports the bucket width alongside the buckets", async () => {
+    // Without it the client has to infer bar width by differencing timestamps,
+    // which breaks on exactly the case the spine exists for: an empty tail.
+    app = await build({ dashboardApiKey: "dashboard-read-only-key-1234" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/admin/stats/timeseries?window=24h",
+      headers: dashboard,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().bucket_seconds).toBe(1_800);
+  });
+
+  it("keeps empty buckets in the payload", async () => {
+    // Dropping them would draw an outage as a shorter, healthier-looking chart.
+    app = await build({ dashboardApiKey: "dashboard-read-only-key-1234" });
+
+    const body = await app
+      .inject({ method: "GET", url: "/v1/admin/stats/timeseries", headers: dashboard })
+      .then((response) => response.json());
+
+    expect(body.data).toHaveLength(2);
+    expect(body.data[1]).toMatchObject({ total: 0, errors: 0 });
+  });
+
+  it("needs the dashboard credential like every other stats route", async () => {
+    app = await build({ dashboardApiKey: "dashboard-read-only-key-1234" });
+
+    expect(
+      (await app.inject({ method: "GET", url: "/v1/admin/stats/timeseries" })).statusCode,
+    ).toBe(401);
+  });
+});
+
+describe("filter facets", () => {
+  it("lists the providers and models present in the window", async () => {
+    app = await build({ dashboardApiKey: "dashboard-read-only-key-1234" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/admin/stats/facets?window=7d",
+      headers: dashboard,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      providers: ["mock", "unrouted"],
+      models: ["echo", "fast"],
+    });
+  });
+});
+
+describe("filtering and paging the request list", () => {
+  it("passes every filter through to the repository", async () => {
+    app = await build({ dashboardApiKey: "dashboard-read-only-key-1234" });
+    recentCalls.length = 0;
+
+    await app.inject({
+      method: "GET",
+      url: "/v1/admin/requests?window=7d&status=error&provider=openai&model=gpt-4.1-mini",
+      headers: dashboard,
+    });
+
+    expect(lastRecentCall()?.filters).toEqual({
+      status: "error",
+      provider: "openai",
+      model: "gpt-4.1-mini",
+    });
+  });
+
+  it("sends no filter keys at all when none were asked for", async () => {
+    // `exactOptionalPropertyTypes` is on: an explicit `undefined` is a different
+    // thing from an absent key, and the repository branches on absence.
+    app = await build({ dashboardApiKey: "dashboard-read-only-key-1234" });
+    recentCalls.length = 0;
+
+    await app.inject({ method: "GET", url: "/v1/admin/requests", headers: dashboard });
+
+    expect(lastRecentCall()?.filters).toEqual({});
+  });
+
+  it("rejects a status outside the enum", async () => {
+    app = await build({ dashboardApiKey: "dashboard-read-only-key-1234" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/admin/requests?status=pending",
+      headers: dashboard,
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it("returns next_cursor so the client never invents one", async () => {
+    app = await build({
+      dashboardApiKey: "dashboard-read-only-key-1234",
+      repository: fakeRepository({
+        recent: async () => ({ items: [item], nextCursor: "2026-08-01T12:00:00.000Z|" + item.id }),
+      }),
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/admin/requests?limit=1",
+      headers: dashboard,
+    });
+
+    expect(response.json().next_cursor).toBe(`2026-08-01T12:00:00.000Z|${item.id}`);
+  });
+
+  it("reports null once there is nothing more to fetch", async () => {
+    app = await build({ dashboardApiKey: "dashboard-read-only-key-1234" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/admin/requests",
+      headers: dashboard,
+    });
+
+    expect(response.json().next_cursor).toBeNull();
+  });
+
+  it("forwards a cursor verbatim", async () => {
+    app = await build({ dashboardApiKey: "dashboard-read-only-key-1234" });
+    recentCalls.length = 0;
+
+    const cursor = `2026-08-01T12:00:00.000Z|${item.id}`;
+    await app.inject({
+      method: "GET",
+      url: `/v1/admin/requests?cursor=${encodeURIComponent(cursor)}`,
+      headers: dashboard,
+    });
+
+    expect(lastRecentCall()?.cursor).toBe(cursor);
   });
 });
 
