@@ -72,6 +72,42 @@ export interface RequestDetail extends RequestItem {
   readonly output_tokens: number | null;
 }
 
+export interface TimeBucket {
+  readonly bucket_start: string;
+  readonly total: number;
+  readonly errors: number;
+}
+
+export interface TimeSeries {
+  readonly bucket_seconds: number;
+  readonly data: readonly TimeBucket[];
+}
+
+export interface Facets {
+  readonly providers: readonly string[];
+  readonly models: readonly string[];
+}
+
+/** Absent keys mean "no filter"; the query string omits them entirely. */
+export interface RequestFilters {
+  readonly status?: "success" | "error";
+  readonly provider?: string;
+  readonly model?: string;
+}
+
+export interface RequestPage {
+  readonly data: readonly RequestItem[];
+  readonly next_cursor: string | null;
+}
+
+/**
+ * Rows per page.
+ *
+ * Small enough that a page fits on screen without scrolling the table out from
+ * under the filter controls, which is the point of paging rather than appending.
+ */
+export const PAGE_SIZE = 15;
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -136,10 +172,31 @@ export const api = {
       (body) => body.data,
     ),
 
-  recent: (window: StatsWindow, limit = 50) =>
-    request<{ data: RequestItem[] }>(`/v1/admin/requests?window=${window}&limit=${limit}`).then(
-      (body) => body.data,
-    ),
+  timeseries: (window: StatsWindow) =>
+    request<TimeSeries>(`/v1/admin/stats/timeseries?window=${window}`),
+
+  facets: (window: StatsWindow) => request<Facets>(`/v1/admin/stats/facets?window=${window}`),
+
+  recent: (options: {
+    window: StatsWindow;
+    filters?: RequestFilters;
+    cursor?: string | null;
+    limit?: number;
+  }) => {
+    // URLSearchParams rather than string concatenation: model names contain
+    // slashes and colons (`mock/echo`, `anthropic:claude-…`) and a hand-built
+    // query string quietly mangles them into a filter that matches nothing.
+    const params = new URLSearchParams({
+      window: options.window,
+      limit: String(options.limit ?? PAGE_SIZE),
+    });
+    for (const [key, value] of Object.entries(options.filters ?? {})) {
+      if (value !== undefined) params.set(key, value);
+    }
+    if (options.cursor != null) params.set("cursor", options.cursor);
+
+    return request<RequestPage>(`/v1/admin/requests?${params.toString()}`);
+  },
 
   detail: (id: string) => request<RequestDetail>(`/v1/admin/requests/${encodeURIComponent(id)}`),
 
