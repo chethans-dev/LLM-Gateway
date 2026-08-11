@@ -242,3 +242,109 @@ describe("circuit breaker over HTTP", () => {
     expect((await chat(app)).statusCode).toBe(200);
   });
 });
+
+describe("the read-only dashboard subtree is not charged to the chat budget", () => {
+  /**
+   * The budget exists to bound provider-backed work. These routes read Postgres
+   * and can never reach a provider, so charging them buys no protection — and
+   * costs a great deal: the dashboard polls several of them every few seconds,
+   * so an idle browser tab quietly consumes most of a caller's allowance.
+   *
+   * The failure this prevents: under heavy traffic the limit trips and the first
+   * casualty is the dashboard, which is the one tool an operator opens to find
+   * out why traffic is heavy.
+   */
+  const repository = {
+    summary: async () => ({
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      successRate: null,
+      averageLatencyMs: null,
+      p95LatencyMs: null,
+      totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCostUsd: 0,
+      requestsWithoutCost: 0,
+      cachedRequests: 0,
+    }),
+    byProvider: async () => [],
+    timeseries: async () => ({ bucketSeconds: 60, buckets: [] }),
+    facets: async () => ({ providers: [], models: [] }),
+    recent: async () => ({ items: [], nextCursor: null }),
+    find: async () => undefined,
+    byTrace: async () => [],
+  };
+
+  async function buildWithStats(limiter: RateLimiter): Promise<FastifyInstance> {
+    const config = createTestConfig({
+      auth: {
+        required: false,
+        adminApiKey: undefined,
+        dashboardApiKey: "dashboard-read-only-key-1234",
+      },
+    });
+    return buildServer({
+      config,
+      logger: silentLogger,
+      lifecycle: fakeLifecycle("ready"),
+      checks: [],
+      version: "0.1.0-test",
+      rateLimiter: limiter,
+      requestRepository: repository,
+    });
+  }
+
+  const dashboard = { authorization: "Bearer dashboard-read-only-key-1234" };
+
+  it.each([
+    "/v1/admin/stats/summary",
+    "/v1/admin/stats/providers",
+    "/v1/admin/stats/timeseries",
+    "/v1/admin/stats/facets",
+    "/v1/admin/requests",
+    "/v1/admin/requests/req_abc",
+    "/v1/admin/traces/tr_abc",
+  ])("serves %s even when the budget is exhausted", async (url) => {
+    const limiter = fakeLimiter([deny]);
+    app = await buildWithStats(limiter);
+
+    const response = await app.inject({ method: "GET", url, headers: dashboard });
+
+    expect(response.statusCode).not.toBe(429);
+    // Not merely allowed — never counted in the first place.
+    expect(limiter.calls).toEqual([]);
+  });
+
+  it("STILL limits key management, which mutates", async () => {
+    const limiter = fakeLimiter([deny]);
+    app = await buildWithStats(limiter);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/admin/keys",
+      headers: dashboard,
+    });
+
+    expect(response.statusCode).toBe(429);
+  });
+
+  it("does not exempt a path that merely starts with an exempt prefix", async () => {
+    // `/v1/admin/requestsomething` must not inherit `/v1/admin/requests`.
+    const limiter = fakeLimiter([deny]);
+    app = await buildWithStats(limiter);
+
+    await app.inject({ method: "GET", url: "/v1/admin/requestsomething", headers: dashboard });
+
+    expect(limiter.calls).not.toEqual([]);
+  });
+
+  it("still limits chat completions", async () => {
+    // The exemption must not have widened into "nothing is limited".
+    const limiter = fakeLimiter([deny]);
+    app = await build({ limiter });
+
+    expect((await chat(app)).statusCode).toBe(429);
+  });
+});

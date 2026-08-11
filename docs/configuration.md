@@ -193,6 +193,16 @@ inconsistently. `redis.call('TIME')` is the one clock they all agree on.
 | `RATE_LIMIT_FAIL_OPEN` | `true` | Allow requests when Redis is unreachable. **On by default**: a limiter that rejects everything during a Redis blip converts a dependency wobble into a total outage. Responses carry `x-openllm-ratelimit-degraded: true` and a warning is logged, so it is never a silent state. Set `false` where exceeding the limit is worse than being unavailable. |
 
 Limits are keyed by **API key** when auth is on, falling back to client IP when it is off.
+
+The budget covers **provider-backed work only**. `/health`, `/ready` and the read-only
+observability routes — `/v1/admin/stats/*`, `/v1/admin/requests*`, `/v1/admin/traces/*` — are
+exempt, because they read Postgres and can never reach a provider, so charging them buys no
+protection. It costs something real, though: the dashboard polls several of those endpoints
+every few seconds, so an idle browser tab would otherwise consume most of a caller's allowance
+just by being open. Worse, under heavy traffic the limit would trip and the first casualty
+would be the dashboard — the one tool you open to find out why traffic is heavy.
+
+Key management (`/v1/admin/keys`) is **not** exempt: it mutates.
 Responses carry OpenAI's header names (`x-ratelimit-limit-requests`,
 `x-ratelimit-remaining-requests`, `x-ratelimit-reset-requests`) plus `retry-after` on a 429, so
 existing client back-off handling works unchanged. `/health` and `/ready` are never limited —

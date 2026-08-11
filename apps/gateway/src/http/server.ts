@@ -14,7 +14,7 @@ import { createActiveStreams, type ActiveStreams } from "./active-streams.js";
 import { registerAuthentication } from "./plugins/authentication.js";
 import { registerErrorHandler } from "./plugins/error-handler.js";
 import { registerObservation, recordObservation } from "./plugins/observation.js";
-import { registerRateLimit } from "./plugins/rate-limit.js";
+import { READ_ONLY_ADMIN_PREFIXES, registerRateLimit } from "./plugins/rate-limit.js";
 import { registerRequestContext } from "./plugins/request-context.js";
 import { registerAdminKeyRoutes } from "./routes/admin-keys.js";
 import { registerAdminStatsRoutes } from "./routes/admin-stats.js";
@@ -138,7 +138,10 @@ export async function buildServer(deps: ServerDependencies): Promise<FastifyInst
   // AFTER authentication, so the limit is keyed by the authenticated caller
   // rather than an IP they can change.
   if (deps.rateLimiter !== undefined) {
-    registerRateLimit(app, { limiter: deps.rateLimiter });
+    registerRateLimit(app, {
+      limiter: deps.rateLimiter,
+      exemptPrefixes: READ_ONLY_ADMIN_PREFIXES,
+    });
   }
 
   if (deps.chatService !== undefined) {

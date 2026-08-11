@@ -6,9 +6,34 @@ export interface RateLimitOptions {
   readonly limiter: RateLimiter;
   /** Paths exempt from limiting. Probes are always exempt. */
   readonly exemptPaths?: ReadonlySet<string>;
+  /** Prefix-matched exemptions, for subtrees with parameterized routes. */
+  readonly exemptPrefixes?: readonly string[];
 }
 
 const ALWAYS_EXEMPT = new Set(["/health", "/ready"]);
+
+/**
+ * The read-only observability subtree.
+ *
+ * Exempt because the budget exists to bound PROVIDER-backed work — the calls
+ * that cost money and can be abused. These read Postgres and can never reach a
+ * provider, so charging them to the same budget buys no protection and costs
+ * something real: the dashboard polls several endpoints every few seconds, so it
+ * quietly consumes most of a caller's allowance just by being open.
+ *
+ * The failure mode that decided this: under heavy traffic the limit trips, and
+ * the first thing to break is the dashboard — the one tool an operator opens to
+ * find out why traffic is heavy. A budget whose exhaustion blinds you to the
+ * cause is worse than no budget.
+ *
+ * Key MANAGEMENT (`/v1/admin/keys`) is deliberately NOT here. It mutates, and
+ * the read-only dashboard credential is refused on it anyway.
+ */
+export const READ_ONLY_ADMIN_PREFIXES: readonly string[] = [
+  "/v1/admin/stats",
+  "/v1/admin/requests",
+  "/v1/admin/traces",
+];
 
 /**
  * Per-caller rate limiting (spec §12).
@@ -27,6 +52,15 @@ export function registerRateLimit(app: FastifyInstance, options: RateLimitOption
   app.addHook("onRequest", async (request, reply) => {
     const path = pathOf(request);
     if (ALWAYS_EXEMPT.has(path) || options.exemptPaths?.has(path) === true) return;
+    // Boundary-aware: `/v1/admin/requestsomething` must not inherit an
+    // exemption meant for `/v1/admin/requests`.
+    if (
+      options.exemptPrefixes?.some(
+        (prefix) => path === prefix || path.startsWith(`${prefix}/`),
+      ) === true
+    ) {
+      return;
+    }
 
     const { scope, identifier } = callerFor(request);
     const decision = await limiter.consume(scope, identifier);
