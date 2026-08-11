@@ -100,39 +100,48 @@ docker compose --profile ollama up
 A **modular monolith**: one deployable process with deliberate internal boundaries.
 
 ```text
-                            ┌─────────────────────────┐
-  client ───────────────────│  Fastify HTTP API       │
-  (OpenAI-compatible SDK)   │                         │
-                            │  request context        │  requestId / traceId
-                            │  authentication         │  API key → hash lookup
-                            │  rate limiting          │  Redis token bucket
-                            │  validation             │  Zod
-                            └───────────┬─────────────┘
-                                        │  ChatRequest
-                            ┌───────────▼─────────────┐
-                            │  Router                 │
-                            │                         │
-                            │  model resolution       │  explicit → alias → route
-                            │  fallback               │  a DIFFERENT provider
-                            │  retry                  │  the SAME provider
-                            │  timeouts               │  per call + per request
-                            └───────────┬─────────────┘
-                                        │  provider-native
-                            ┌───────────▼─────────────┐
-                            │  LLMProvider            │
-                            │  OpenAI · Anthropic ·   │
-                            │  Gemini · Ollama · Mock │
-                            └───────────┬─────────────┘
-                                        │
-              ┌─────────────────────────┴───────────────────────┐
-              │                                                 │
-      ┌───────▼────────┐                              ┌─────────▼────────┐
-      │  Redis         │                              │  PostgreSQL      │
-      │  rate limits   │                              │  api_keys        │
-      │  response cache│                              │  requests        │
-      │  provider health│                             │                  │
-      └────────────────┘                              └──────────────────┘
+      client  (OpenAI-compatible SDK)       dashboard  (React, served by nginx)
+      │                                     │
+      │  POST /v1/chat/completions          │  GET /v1/admin/stats/*
+      │  GET  /v1/models                    │  GET /v1/admin/requests
+      │                                     │      read-only credential
+      └─────────────┬───────────────────────┘
+  ┌─────────────────▼────────────────────────────┐
+  │  Fastify HTTP API                            │
+  │                                              │
+  │  request context     requestId / traceId     │
+  │  authentication      SHA-256 key lookup      │ ──► PostgreSQL  api_keys
+  │  rate limiting       Redis token bucket      │ ──► Redis       token buckets
+  │  validation          Zod schemas             │
+  │  observation         metadata only, buffered │ ──► PostgreSQL  requests
+  └─────────────────┬────────────────────────────┘
+                    │  ChatRequest
+  ┌─────────────────▼────────────────────────────┐
+  │  Router  (ChatService)                       │
+  │                                              │
+  │  model resolution    explicit → alias → route│
+  │  response cache      opt-in, off by default  │ ──► Redis       completions
+  │  circuit breaker     skip failing providers  │ ──► Redis       failure counts
+  │  fallback            a DIFFERENT provider    │
+  │  retry               the SAME provider       │
+  │  timeouts            per call + per request  │
+  └─────────────────┬────────────────────────────┘
+                    │  provider-native request
+  ┌─────────────────▼────────────────────────────┐
+  │  LLMProvider adapters                        │
+  │                                              │
+  │  OpenAI · Anthropic · Gemini · Ollama        │
+  │  Mock                no network, for tests   │
+  └─────────────────┬────────────────────────────┘
+                    │  HTTPS
+                    ▼
+      api.openai.com · api.anthropic.com
+      generativelanguage.googleapis.com · your Ollama host
 ```
+
+Redis and Postgres hang off the layers that actually use them. Nothing in the provider
+adapters touches either: they translate a request, make one HTTPS call, and translate the
+answer back. That is what keeps a new provider a single file with no infrastructure to wire up.
 
 ### Why a monolith
 
